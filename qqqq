@@ -19,6 +19,7 @@ namespace sqlite_calisan
         private List<string> selectedChannelNames;
         private Form2 form2;
 
+        private bool visaError = false;        // yeni eklendi
         private bool paused = false;
         private DateTime pauseStartTime;
         private TimeSpan totalPauseDuration;
@@ -180,6 +181,29 @@ namespace sqlite_calisan
             }
             return double.NaN; // Eğer bir değer bulunamazsa NaN döner
         }
+
+        private bool CheckConnection()
+		{
+			try
+			{
+				// cihazla iletişimm kurmak için basit bir komut gönder
+			/*	instrument.WriteString("*IDN?");
+					string response = instrument.ReadString();
+					return !string.IsNullOrEmpty(response);	
+           */
+
+            instrument.WriteString($"*IDN?; *OPC?");
+            string response = instrument.ReadString();
+
+        return response.Contains(deviceAddress);
+            
+			}
+			catch
+			{
+				return false;
+			}
+		}
+
         private async void btnStart_Click(object sender, EventArgs e)
         {
             selectedChannelNames = new List<string>();
@@ -443,6 +467,7 @@ namespace sqlite_calisan
                         if (ex.Message.Contains("VISA error"))
                         {
                             paused = true;
+                            visaError = true;
                             MessageBox.Show("Test cihazıyla bağlantı kesildi. Ölçüm duraklatıldı. Lütfen cihaz bağlantısını kontrol edip tekrar başlatın.", "Bağlantı Hatası", MessageBoxButtons.OK, MessageBoxIcon.Error);
                             break;
                         }
@@ -451,6 +476,28 @@ namespace sqlite_calisan
                             MessageBox.Show($"Beklenmeyen bir hata oluştu: {ex.Message}", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
                             break;
                         }
+
+                    if (visaError)  // yeni
+						{
+							txt_HataMesaji.AppendText("Test cihazı ile tekrardan bağlantı kurulmaya çalışıyor ...");
+							while(visaError)
+							{
+								// burda bağlantının yeniden sağlanıp sağlanmadıgı kontrol edilmeli
+								if (CheckConnection())
+								{
+									visaError = false;
+									paused = false;
+									txt_HataMesaji.AppendText("Test cihazı ile tekrardan bağlantı sağlandı ölçüm kaldığı yerden devam edecek");
+								    goto olcume_devam;
+                                }
+								else
+								{
+									// 5 saniyede bir bağlantıyı kontrol et
+									await Task.Delay(5000);
+								}
+							}
+						}
+
                     }
 
 
