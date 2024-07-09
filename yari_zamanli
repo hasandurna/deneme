@@ -1,0 +1,603 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SQLite;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using Ivi.Visa.Interop;
+
+namespace sqlite_calisan
+{
+    public partial class Form1 : Form
+    {
+        private const string Format = "_yyyy-MM-dd HH.mm.ss";
+        private string selectedChannels;
+        private List<string> selectedChannelNames;
+        private Form2 form2;
+        private bool retry = false, stop = false;
+
+        private bool paused = false;
+        private DateTime pauseStartTime;
+        private TimeSpan totalPauseDuration;
+
+        public Form1()
+        {
+            InitializeComponent();
+            SetInitialButtonStates();
+        }
+
+        private void InitializeForm2()
+        {
+            form2 = new Form2();
+        }
+
+
+        public class DirencGirisi
+        {
+            public string Kanal { get; set; }
+            public double? Deger { get; set; }
+            public int? Tolerans { get; set; }
+        }
+
+        private bool IsValidFileName(string fileName)
+        {
+            char[] invalidChars = System.IO.Path.GetInvalidFileNameChars();
+            foreach (char invalidChar in invalidChars)
+            {
+                if (fileName.Contains(invalidChar))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+
+        private Dictionary<string, int> channelMapping = new Dictionary<string, int>
+        {
+              { "1A", 101 },
+              { "1B", 102 },
+              { "1C", 103 },
+              { "2A", 104 },
+              { "2B", 105 },
+              { "2C", 106 },
+              { "3A", 107 },
+              { "3B", 108 },
+              { "3C", 109 },
+              { "Termokupl", 110 },
+        };
+
+
+        private void SetInitialButtonStates()
+        {
+            btnStart.Enabled = true;
+            btn_Stop.Enabled = false;
+            btn_Pause.Enabled = false;
+            btn_Resume.Enabled = false;
+        }
+
+        private List<DirencGirisi> direncGirisleri = new List<DirencGirisi>();
+
+        private List<DirencGirisi> InitializeDirencGirisleri()
+        {
+            var direncGirisleri = new List<DirencGirisi>();
+
+            try
+            {
+                foreach (var item in checkedListBox1.CheckedItems)
+                {
+                    string channelName = item.ToString();
+
+                    if (channelName == "Termokupl")
+                    {
+
+                        direncGirisleri.Add(new DirencGirisi { Kanal = channelName });
+                    }
+                    else
+                    {
+                        int tolerans = ParseTolerans();
+                        string textBoxName = $"txtDirenc{channelName}";
+                        TextBox textBox = Controls.Find(textBoxName, true).FirstOrDefault() as TextBox;
+                        if (textBox != null)
+                        {
+                            double deger;
+                            if (double.TryParse(textBox.Text, out deger))
+                            {
+                                direncGirisleri.Add(new DirencGirisi { Kanal = channelName, Deger = deger, Tolerans = tolerans });
+                            }
+                            else
+                            {
+                                throw new FormatException($"Kanal '{channelName}' için geçersiz bir sayı girildi.");
+                            }
+                        }
+                        else
+                        {
+                            throw new Exception($"Metin kutusu '{textBoxName}' bulunamadı.");
+                        }
+                    }
+                }
+            }
+            catch (FormatException ex)
+            {
+                MessageBox.Show(ex.Message, "Geçersiz Giriş", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message, "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+
+
+            if (direncGirisleri == null)
+            {
+                throw new Exception("direncGirisleri listesi null olarak tanımlandı.");
+            }
+
+
+            return direncGirisleri;
+        }
+
+
+        private int ParseTolerans()
+        {
+            string toleransInput = txt_deger_tolerans.Text.Trim();
+            if (int.TryParse(toleransInput, out int tolerans) && tolerans > 0)
+            {
+                return tolerans;
+            }
+            else
+            {
+                throw new FormatException("Geçersiz tolerans değeri. Lütfen pozitif bir sayı girin.");
+            }
+        }
+
+        private double GetResistanceMeasurementForChannel(SQLiteConnection connection, string channelName)
+        {
+            string query = $"SELECT [{channelName}] FROM Measurements ORDER BY OlcumSirasi DESC LIMIT 1";
+            using (var command = new SQLiteCommand(query, connection))
+            {
+                using (SQLiteDataReader reader = command.ExecuteReader())
+                {
+                    if (reader.Read())
+                    {
+                        double resistanceValue;
+                        if (double.TryParse(reader[channelName].ToString(), out resistanceValue))
+                        {
+                            return resistanceValue;
+                        }
+                    }
+                }
+            }
+            return double.NaN;
+        }
+
+
+        private async void btnStart_Click(object sender, EventArgs e)
+        {
+            selectedChannelNames = new List<string>();
+
+            form2 = new Form2();
+            string gun;
+            string saat;
+            string dakika;
+
+            gun = ((txtBox_Gun.Text.Trim() != null) && (txtBox_Gun.Text.Trim() != string.Empty)) ? txtBox_Gun.Text.Trim() : "0";
+            saat = ((txtBox_Gun.Text.Trim() != null) && (txtBox_Saat.Text.Trim() != string.Empty)) ? txtBox_Saat.Text.Trim() : "0";
+            dakika = ((txtBox_Gun.Text.Trim() != null) && (txtBox_Dakika.Text.Trim() != string.Empty)) ? txtBox_Dakika.Text.Trim() : "0";
+
+            if (gun == "0" && saat == "0" && dakika == "0")
+            {
+                MessageBox.Show("Lütfen ölçüm süresi için gün, saat ve dakika bilgilerini giriniz.", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            int gunDeger, saatDeger, dakikaDeger;
+            if (!int.TryParse(gun, out gunDeger) || gunDeger < 0 ||
+                !int.TryParse(saat, out saatDeger) || saatDeger < 0 ||
+                !int.TryParse(dakika, out dakikaDeger) || dakikaDeger < 0)
+            {
+                MessageBox.Show("Geçersiz ölçüm süresi. Lütfen pozitif tam sayılar giriniz.", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+
+            long measurementDuration = (long)gunDeger * 24 * 60 * 60 + (long)saatDeger * 60 * 60 + (long)dakikaDeger * 60;
+            if (measurementDuration <= 0)
+            {
+                MessageBox.Show("Ölçüm süresi sıfırdan büyük olmalıdır.", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            string dosyaAdi = txtBox_DosyaIsmi.Text.Trim();
+            if (string.IsNullOrEmpty(dosyaAdi))
+            {
+                MessageBox.Show("Lütfen bir dosya adı giriniz.", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+
+            if (!IsValidFileName(dosyaAdi))
+            {
+                MessageBox.Show("Dosya adı geçersiz karakterler içeriyor. Lütfen geçerli bir dosya adı giriniz.", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+
+            if (checkedListBox1.CheckedItems.Count == 0)
+            {
+                MessageBox.Show("Lütfen en az bir kanal seçimi yapınız.", "Uyarı", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            btnStart.Enabled = false;
+            btn_Stop.Enabled = true;
+            btn_Pause.Enabled = true;
+            btn_Resume.Enabled = false;
+
+            selectedChannels = "@";
+            selectedChannelNames = new List<string>();
+            foreach (var item in checkedListBox1.CheckedItems)
+            {
+
+                string channelName = item.ToString();
+                int channelNumber = channelMapping[channelName];
+                selectedChannels += channelNumber.ToString() + ",";
+                selectedChannelNames.Add(channelName);
+
+            }
+            selectedChannels = selectedChannels.TrimEnd(',');
+
+            string deviceAddress = "USB0::0x0957::0x2007::MY49029428::INSTR";
+            string timestamp = DateTime.Now.ToString(Format);
+            string databasePath = $"{dosyaAdi}_{timestamp}.sqlite";
+
+            try
+            {
+                InitializeDatabase(databasePath);
+                direncGirisleri = InitializeDirencGirisleri();
+
+                FormattedIO488 instrument = null;
+                SQLiteConnection connection = null;
+                bool isFirstConnection = true;
+                do
+                {
+                    try
+                    {
+                        instrument = InitializeInstrument(deviceAddress);
+                        if (!retry)
+                        {
+                            connection = new SQLiteConnection($"Data Source={databasePath};Version=3;");
+                            connection.Open();
+
+                            if (!isFirstConnection)
+                            {
+                                txt_HataMesajı.AppendText(" Bağlantı tekrar sağlandı  ");
+                                paused = false;
+                                btn_Pause.Enabled = true;
+                                btn_Resume.Enabled = false;
+                            }
+                            isFirstConnection = false;
+                        }
+
+                        await PerformMeasurements(instrument, databasePath, measurementDuration);
+
+                    }
+                    catch (COMException ex) when (ex.ErrorCode == unchecked((int)0x80040011))
+                    {
+                        if (!retry)
+                        {
+                            txt_HataMesajı.AppendText(" Bağlantı Hatası  ");
+                            paused = true;
+                            btn_Pause.Enabled = false;
+                            btn_Resume.Enabled = true;
+                        }
+                        retry = true;
+                    }
+                    finally
+                    {
+                        instrument?.IO.Close();
+                        connection?.Close();
+                    }
+
+                } while (stop == false);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Bir hata oluştu: {ex.Message}", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+
+        private FormattedIO488 InitializeInstrument(string deviceAddress)
+        {
+            var rm = new ResourceManager();
+            var instrument = new FormattedIO488();
+            try
+            {
+                instrument.IO = (IMessage)rm.Open(deviceAddress, AccessMode.NO_LOCK, 0, "");
+                instrument.WriteString("*RST");
+                instrument.WriteString($"CONF:FRES ({selectedChannels})");
+                instrument.WriteString($"CONF:TEMP (@110)");
+                instrument.WriteString($"ROUT:SCAN ({selectedChannels})");
+                return instrument;
+            }
+            catch
+            {
+                instrument?.IO?.Close();
+                throw;
+            }
+        }
+
+        private void InitializeDatabase(string databasePath)
+        {
+            if (!System.IO.File.Exists(databasePath))
+            {
+                SQLiteConnection.CreateFile(databasePath);
+
+                using (var connection = new SQLiteConnection($"Data Source={databasePath};Version=3;"))
+                {
+                    connection.Open();
+                    string createTableQuery = @"CREATE TABLE IF NOT EXISTS Measurements (
+                                        OlcumSirasi INTEGER PRIMARY KEY AUTOINCREMENT,
+                                        Tarih TEXT NOT NULL";
+                    foreach (string channelName in selectedChannelNames)
+                    {
+                        createTableQuery += $", [{channelName}] REAL";
+                    }
+                    createTableQuery += ");";
+                    using (var command = new SQLiteCommand(createTableQuery, connection))
+                    {
+                        command.ExecuteNonQuery();
+                    }
+
+                    // Bağlantı başarılı olduğunda mesajı ekle
+                    txt_HataMesajı.AppendText("Bağlantı sağlandı." + Environment.NewLine);
+                }
+            }
+        }
+
+
+        private async Task PerformMeasurements(FormattedIO488 instrument, string databasePath, long measurementDuration)
+        {
+            SQLiteConnection connection = null;
+
+            try
+            {
+                // Bağlantıyı aç
+                connection = new SQLiteConnection($"Data Source={databasePath};Version=3;");
+                connection.Open();
+
+                DateTime startTime = DateTime.Now;
+                DateTime pauseStart = DateTime.MinValue;
+                long elapsedPausedTime = 0;
+
+                form2.Show();
+
+                while (!stop)
+                {
+                    long totalElapsedTime = (long)(DateTime.Now - startTime).TotalSeconds - elapsedPausedTime;
+
+                    if (totalElapsedTime >= measurementDuration)
+                    {
+                        break;
+                    }
+
+                    if (paused)
+                    {
+                        if (pauseStart == DateTime.MinValue)
+                        {
+                            pauseStart = DateTime.Now;
+                        }
+                        await Task.Delay(3000);
+                        continue;
+                    }
+                    else
+                    {
+                        if (pauseStart != DateTime.MinValue)
+                        {
+                            elapsedPausedTime += (long)(DateTime.Now - pauseStart).TotalSeconds;
+                            pauseStart = DateTime.MinValue;
+                        }
+                    }
+
+                    string timeStamp = DateTime.Now.ToString();
+
+                    try
+                    {
+                        instrument.WriteString("READ?");
+                        await Task.Delay(2000);
+                        string result = instrument.ReadString();
+                        string[] results = result.Split(',');
+
+                        InsertMeasurement(connection, timeStamp, results);
+                        var dataTable = LoadDataFromDatabase(connection);
+                        UpdateDataGridView(dataTable);
+                    }
+                    catch (COMException ex) when (ex.ErrorCode == unchecked((int)0x80040011))
+                    {
+                        paused = true;
+                        MessageBox.Show("Test cihazıyla bağlantı kesildi. Ölçüm duraklatıldı. Lütfen cihaz bağlantısını kontrol edip tekrar başlatın.", "Bağlantı Hatası", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        if (ex.Message.Contains("VISA error"))
+                        {
+                            paused = true;
+                            MessageBox.Show("Test cihazıyla bağlantı kesildi. Ölçüm duraklatıldı. Lütfen cihaz bağlantısını kontrol edip tekrar başlatın.", "Bağlantı Hatası", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            break;
+                        }
+                        else
+                        {
+                            MessageBox.Show($"Beklenmeyen bir hata oluştu: {ex.Message}", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            break;
+                        }
+                    }
+
+                    foreach (var channelName in selectedChannelNames)
+                    {
+                        try
+                        {
+                            var direncGirisi = direncGirisleri.FirstOrDefault(d => d.Kanal == channelName);
+
+                            double girilenDeger;
+
+                            if (channelName == "Termokupl")
+                            {
+                                girilenDeger = GetResistanceMeasurementForChannel(connection, channelName);
+                            }
+                            else
+                            {
+                                double toleransYuzdesi = direncGirisi.Tolerans.HasValue ? direncGirisi.Tolerans.Value / 100.0 : 0.0;
+                                double deger = direncGirisi.Deger ?? 0.0;
+
+                                double minDeger = deger * (1 - toleransYuzdesi);
+                                double maxDeger = deger * (1 + toleransYuzdesi);
+                                double olculenDeger = GetResistanceMeasurementForChannel(connection, channelName);
+
+                                if (olculenDeger < minDeger)
+                                {
+                                    int olcumSirasi = GetOlcumSirasi(connection);
+                                    txt_HataMesajı.AppendText($"{channelName} direncinde beklenmeyen bir sonuç okundu. Ölçüm Sırası: {olcumSirasi} " + Environment.NewLine);
+                                }
+                                else if (olculenDeger > 1000)
+                                {
+                                    int olcumSirasi = GetOlcumSirasi(connection);
+                                    paused = true;
+                                    btn_Resume.Enabled = true;
+                                    btn_Pause.Enabled = false;
+                                    txt_HataMesajı.AppendText($"{channelName} direncinde açık devre tespit edildi. Ölçüm Sırası: {olcumSirasi} " + Environment.NewLine);
+                                    MessageBox.Show($"{channelName} Direncinde Açık Devre Tespit Edildi ! Ölçüm Sırası: {olcumSirasi}", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                    break;
+                                }
+                                else if (olculenDeger > maxDeger)
+                                {
+                                    int olcumSirasi = GetOlcumSirasi(connection);
+                                    txt_HataMesajı.AppendText($"{channelName} direncinde beklenmeyen bir sonuç okundu. Ölçüm Sırası: {olcumSirasi} " + Environment.NewLine);
+                                }
+
+                                girilenDeger = 0.0;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            MessageBox.Show($"Bir hata oluştu: {ex.Message}", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
+                    }
+
+                    retry = false;
+                    await Task.Delay(2000);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Bir hata oluştu: {ex.Message}", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                // Bağlantıyı kapat
+                connection?.Close();
+            }
+        }
+
+
+
+        private void InsertMeasurement(SQLiteConnection connection, string timeStamp, string[] results)
+        {
+            string insertQuery = "INSERT INTO Measurements (Tarih";
+            foreach (string channelName in selectedChannelNames)
+            {
+                insertQuery += $", [{channelName}]";
+            }
+            insertQuery += ") VALUES (@Tarih";
+            for (int i = 0; i < results.Length; i++)
+            {
+                insertQuery += $", @Channel{i + 1}";
+            }
+            insertQuery += ");";
+
+            insertQuery += "SELECT last_insert_rowid();";           // bura yoktu
+
+            using (var command = new SQLiteCommand(insertQuery, connection))
+            {
+                command.Parameters.AddWithValue("@Tarih", timeStamp);
+                for (int i = 0; i < results.Length; i++)
+                {
+                    command.Parameters.AddWithValue($"@Channel{i + 1}", results[i]);
+                }
+
+                int olcumSirasi = Convert.ToInt32(command.ExecuteScalar());
+
+                Console.WriteLine($"Eklenen ölçümün sırası: {olcumSirasi}");
+            }
+        }
+
+
+        private int GetOlcumSirasi(SQLiteConnection connection)
+        {
+            string query = "SELECT last_insert_rowid();";
+            using (var command = new SQLiteCommand(query, connection))
+            {
+
+                int olcumSirasi = Convert.ToInt32(command.ExecuteScalar());
+                return olcumSirasi;
+            }
+        }
+
+
+        private DataTable LoadDataFromDatabase(SQLiteConnection connection)
+        {
+            using (var command = new SQLiteCommand("SELECT * FROM Measurements", connection))
+            using (var adapter = new SQLiteDataAdapter(command))
+            {
+                var dataTable = new DataTable();
+                adapter.Fill(dataTable);
+                return dataTable;
+            }
+        }
+
+
+        private void UpdateDataGridView(DataTable dataTable)
+        {
+            if (form2.InvokeRequired)
+            {
+                form2.Invoke(new Action(() => form2.LoadDataIntoDataGridView(dataTable)));
+            }
+            else
+            {
+                form2.LoadDataIntoDataGridView(dataTable);
+            }
+        }
+
+        private void btn_Stop_Click(object sender, EventArgs e)
+        {
+            stop = true;
+            btnStart.Enabled = true;
+            Application.Exit();
+        }
+
+        private void btn_Pause_Click(object sender, EventArgs e)
+        {
+            if (!paused)
+            {
+                pauseStartTime = DateTime.Now;
+                paused = true;
+                btn_Resume.Enabled = true;
+                btn_Pause.Enabled = false;
+            }
+        }
+
+        private void btn_Resume_Click(object sender, EventArgs e)
+        {
+            if (paused)
+            {
+                totalPauseDuration += DateTime.Now - pauseStartTime;
+                paused = false;
+                btn_Resume.Enabled = false;
+                btn_Pause.Enabled = true;
+            }
+        }
+    }
+}
